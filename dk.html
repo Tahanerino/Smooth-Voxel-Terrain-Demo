@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Smooth Deformable Terrain</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#071018;font-family:system-ui,sans-serif}
+canvas{display:block;width:100vw;height:100vh;cursor:crosshair}
+#hud{position:fixed;left:12px;top:12px;color:#e8f2ff;font-size:14px;line-height:1.35;text-shadow:0 1px 2px #0008;pointer-events:none;user-select:none;max-width:420px}
+#center{position:fixed;left:50%;top:50%;width:16px;height:16px;transform:translate(-50%,-50%);pointer-events:none}
+#center:before,#center:after{content:"";position:absolute;background:#fff9;box-shadow:0 0 4px #000}
+#center:before{left:7px;top:0;width:2px;height:16px}
+#center:after{left:0;top:7px;width:16px;height:2px}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud">Click to lock mouse<br>WASD move · Space jump · Left click punch · Q/E up/down punch · F powerful punch</div>
+<div id="center"></div>
+<script>
+(() => {
+'use strict';
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl', {antialias:true, alpha:false, depth:true});
+if(!gl){document.body.innerHTML='WebGL not supported';return;}
+canvas.oncontextmenu = e => e.preventDefault();
+const DPR = () => Math.min(2, devicePixelRatio || 1);
+let W=0,H=0;
+function resize(){
+  const d = DPR();
+  W = Math.floor(innerWidth*d);
+  H = Math.floor(innerHeight*d);
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = innerWidth+'px';
+  canvas.style.height = innerHeight+'px';
+  gl.viewport(0,0,W,H);
+}
+addEventListener('resize', resize); resize();
+
+const vs = `
+attribute vec3 aPos;
+attribute vec3 aNormal;
+uniform mat4 uProj;
+uniform mat4 uView;
+uniform mat4 uModel;
+varying vec3 vN;
+varying vec3 vW;
+void main(){
+  vec4 wp = uModel * vec4(aPos,1.0);
+  vW = wp.xyz;
+  vN = mat3(uModel) * aNormal;
+  gl_Position = uProj * uView * wp;
+}`;
+const fs = `
+precision mediump float;
+varying vec3 vN;
+varying vec3 vW;
+uniform vec3 uLightDir;
+uniform vec3 uCamPos;
+uniform vec3 uBaseColor;
+void main(){
+  vec3 n = normalize(vN);
+  float diff = max(dot(n, normalize(-uLightDir)), 0.0);
+  float rim = pow(1.0 - max(dot(n, normalize(uCamPos - vW)),0.0), 2.0);
+  float sky = 0.35 + 0.65*max(n.y, 0.0);
+  vec3 col = uBaseColor * (0.2 + diff*0.95 + sky*0.25) + rim*0.05;
+  gl_FragColor = vec4(col, 1.0);
+}`;
+function compile(type, src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog = gl.createProgram(); gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog); if(!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const loc = {
+  aPos: gl.getAttribLocation(prog,'aPos'),
+  aNormal: gl.getAttribLocation(prog,'aNormal'),
+  uProj: gl.getUniformLocation(prog,'uProj'),
+  uView: gl.getUniformLocation(prog,'uView'),
+  uModel: gl.getUniformLocation(prog,'uModel'),
+  uLightDir: gl.getUniformLocation(prog,'uLightDir'),
+  uCamPos: gl.getUniformLocation(prog,'uCamPos'),
+  uBaseColor: gl.getUniformLocation(prog,'uBaseColor')
+};
+
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+gl.cullFace(gl.BACK);
+gl.clearColor(0.55,0.75,0.95,1);
+
+const CHUNK = 12;
+const MAX_BUILD_PER_FRAME = 2;
+const renderRadiusX = 3;
+const renderRadiusY = 1;
+const densityMap = new Map();
+const chunks = new Map();
+const dirtyQueue = [];
+const key3 = (x,y,z) => x + ',' + y + ',' + z;
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp = (a,b,t)=>a+(b-a)*t;
+const smooth = t=>t*t*(3-2*t);
+const invLerp = (a,b,v)=> (v-a)/(b-a);
+function norm3(x,y,z){ const l = Math.hypot(x,y,z) || 1; return [x/l,y/l,z/l]; }
+function cross(ax,ay,az,bx,by,bz){ return [ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx]; }
+function dot3(ax,ay,az,bx,by,bz){ return ax*bx+ay*by+az*bz; }
+function mat4Perspective(fov, aspect, near, far){
+  const f = 1/Math.tan(fov/2), nf = 1/(near-far);
+  return new Float32Array([f/aspect,0,0,0,0,f,0,0,0,0,(far+near)*nf,-1,0,0,2*far*near*nf,0]);
+}
+function mat4LookAt(eye, target, up){
+  const zx = eye[0]-target[0], zy = eye[1]-target[1], zz = eye[2]-target[2];
+  let l = Math.hypot(zx,zy,zz) || 1; const z0=zx/l, z1=zy/l, z2=zz/l;
+  const xx = up[1]*z2-up[2]*z1, xy = up[2]*z0-up[0]*z2, xz = up[0]*z1-up[1]*z0;
+  l = Math.hypot(xx,xy,xz) || 1; const x0=xx/l, x1=xy/l, x2=xz/l;
+  const y0 = z1*x2-z2*x1, y1 = z2*x0-z0*x2, y2 = z0*x1-z1*x0;
+  return new Float32Array([
+    x0,y0,z0,0,
+    x1,y1,z1,0,
+    x2,y2,z2,0,
+    -(x0*eye[0]+x1*eye[1]+x2*eye[2]),-(y0*eye[0]+y1*eye[1]+y2*eye[2]),-(z0*eye[0]+z1*eye[1]+z2*eye[2]),1
+  ]);
+}
+function mat4Identity(){ return new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]); }
+function mat4Mul(a,b){
+  const o = new Float32Array(16);
+  for(let r=0;r<4;r++) for(let c=0;c<4;c++) o[c*4+r]=a[r]*b[c*4]+a[4+r]*b[c*4+1]+a[8+r]*b[c*4+2]+a[12+r]*b[c*4+3];
+  return o;
+}
+function mat4Translate(m, v){ const t=mat4Identity(); t[12]=v[0]; t[13]=v[1]; t[14]=v[2]; return mat4Mul(m,t); }
+function mat4Scale(m, v){ const s=mat4Identity(); s[0]=v[0]; s[5]=v[1]; s[10]=v[2]; return mat4Mul(m,s); }
+function mat4RotateY(m, a){ const c=Math.cos(a), s=Math.sin(a); const r=mat4Identity(); r[0]=c;r[2]=s;r[8]=-s;r[10]=c; return mat4Mul(m,r); }
+function mat4RotateX(m, a){ const c=Math.cos(a), s=Math.sin(a); const r=mat4Identity(); r[5]=c;r[6]=-s;r[9]=s;r[10]=c; return mat4Mul(m,r); }
+
+function hash3i(x,y,z){
+  let n = (x*374761393 + y*668265263 + z*2147483647) | 0;
+  n = (n ^ (n >>> 13)) * 1274126177;
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967295;
+}
+function valueNoise3(x,y,z){
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const xf = x - xi, yf = y - yi, zf = z - zi;
+  const u = smooth(xf), v = smooth(yf), w = smooth(zf);
+  function c(dx,dy,dz){ return hash3i(xi+dx, yi+dy, zi+dz); }
+  const x00 = lerp(c(0,0,0), c(1,0,0), u);
+  const x10 = lerp(c(0,1,0), c(1,1,0), u);
+  const x01 = lerp(c(0,0,1), c(1,0,1), u);
+  const x11 = lerp(c(0,1,1), c(1,1,1), u);
+  const y0 = lerp(x00, x10, v);
+  const y1 = lerp(x01, x11, v);
+  return lerp(y0, y1, w) * 2 - 1;
+}
+function fbm3(x,y,z){
+  let s=0, a=1, f=0.045;
+  for(let i=0;i<4;i++){ s += a * valueNoise3(x*f, y*f, z*f); f *= 2; a *= 0.5; }
+  return s;
+}
+function terrainHeight(x,z){
+  return 18 + fbm3(x, 0, z) * 6 + fbm3(x*1.8, 0.3, z*1.8) * 3;
+}
+function baseDensity(x,y,z){
+  let d = y - terrainHeight(x,z);
+  d -= fbm3(x*0.85, y*0.85, z*0.85) * 1.3;
+  d -= fbm3(x*0.16, y*0.16, z*0.16) * 2.0;
+  d += Math.max(0, fbm3(x*0.22 + 18, y*0.22 - 11, z*0.22 + 7) - 0.12) * 4.5;
+  return d;
+}
+function pKey(ix,iy,iz){ return ix + '|' + iy + '|' + iz; }
+function getDensityPoint(ix,iy,iz){
+  const k = pKey(ix,iy,iz);
+  if(densityMap.has(k)) return densityMap.get(k);
+  const v = baseDensity(ix,iy,iz);
+  densityMap.set(k, v);
+  return v;
+}
+function setDensityPoint(ix,iy,iz,v){ densityMap.set(pKey(ix,iy,iz), v); }
+function addDensityPoint(ix,iy,iz,delta){ setDensityPoint(ix,iy,iz, getDensityPoint(ix,iy,iz) + delta); }
+
+function chunkKey(cx,cy,cz){ return cx + ',' + cy + ',' + cz; }
+function getChunk(cx,cy,cz,create=true){
+  const k = chunkKey(cx,cy,cz);
+  let c = chunks.get(k);
+  if(!c && create){
+    c = {cx,cy,cz, dirty:true, vb:null, nb:null, count:0, visible:false, lastBuilt:0};
+    chunks.set(k, c);
+    dirtyQueue.push(c);
+  }
+  return c;
+}
+function markChunkDirty(cx,cy,cz){
+  const c = getChunk(cx,cy,cz,true);
+  if(!c.dirty){ c.dirty = true; dirtyQueue.push(c); }
+}
+function pointToChunkRange(ix,iy,iz){
+  const cx = Math.floor(ix / CHUNK), cy = Math.floor(iy / CHUNK), cz = Math.floor(iz / CHUNK);
+  return [cx,cy,cz];
+}
+function markPointDirty(ix,iy,iz){
+  const [cx,cy,cz] = pointToChunkRange(ix,iy,iz);
+  for(let dx=-1; dx<=0; dx++) for(let dy=-1; dy<=0; dy++) for(let dz=-1; dz<=0; dz++){
+    const c = getChunk(cx+dx, cy+dy, cz+dz, false);
+    if(c) markChunkDirty(c.cx,c.cy,c.cz);
+  }
+  markChunkDirty(cx,cy,cz);
+}
+function markRegionDirty(minx,miny,minz,maxx,maxy,maxz){
+  const cminx = Math.floor(minx / CHUNK) - 1, cmaxx = Math.floor(maxx / CHUNK) + 1;
+  const cminy = Math.floor(miny / CHUNK) - 1, cmaxy = Math.floor(maxy / CHUNK) + 1;
+  const cminz = Math.floor(minz / CHUNK) - 1, cmaxz = Math.floor(maxz / CHUNK) + 1;
+  for(let cx=cminx; cx<=cmaxx; cx++) for(let cy=cminy; cy<=cmaxy; cy++) for(let cz=cminz; cz<=cmaxz; cz++){
+    const c = getChunk(cx,cy,cz,false);
+    if(c) markChunkDirty(cx,cy,cz);
+  }
+}
+function deformSphere(center, radius, amount){
+  const [cx,cy,cz] = center;
+  const minx = Math.floor(cx - radius - 1), maxx = Math.ceil(cx + radius + 1);
+  const miny = Math.floor(cy - radius - 1), maxy = Math.ceil(cy + radius + 1);
+  const minz = Math.floor(cz - radius - 1), maxz = Math.ceil(cz + radius + 1);
+  for(let x=minx; x<=maxx; x++) for(let y=miny; y<=maxy; y++) for(let z=minz; z<=maxz; z++){
+    const dx = x - cx, dy = y - cy, dz = z - cz;
+    const d = Math.hypot(dx,dy,dz);
+    if(d > radius) continue;
+    const t = 1 - d / radius;
+    const fall = t*t*(3-2*t);
+    const delta = amount * fall * fall;
+    if(delta !== 0){
+      addDensityPoint(x,y,z, delta);
+      markPointDirty(x,y,z);
+    }
+  }
+}
+function deformCapsule(a, b, radius, amount, samples){
+  for(let i=0;i<=samples;i++){
+    const t = i / samples;
+    deformSphere([lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t)], radius, amount / (samples + 1));
+  }
+}
+function estimateGrad(x,y,z){
+  const e = 0.35;
+  const dx = sampleDensity(x+e,y,z) - sampleDensity(x-e,y,z);
+  const dy = sampleDensity(x,y+e,z) - sampleDensity(x,y-e,z);
+  const dz = sampleDensity(x,y,z+e) - sampleDensity(x,y,z-e);
+  return norm3(dx,dy,dz);
+}
+
+const cubeVerts = [
+  [0,0,0],[1,0,0],[1,1,0],[0,1,0],
+  [0,0,1],[1,0,1],[1,1,1],[0,1,1]
+];
+const tets = [
+  [0,5,1,6],
+  [0,1,2,6],
+  [0,2,3,6],
+  [0,3,7,6],
+  [0,7,4,6],
+  [0,4,5,6]
+];
+const tetEdges = [[0,1],[1,2],[2,0],[0,3],[1,3],[2,3]];
+function interp(p1,p2,v1,v2){
+  const t = v1 === v2 ? 0.5 : (0 - v1) / (v2 - v1);
+  return [lerp(p1[0],p2[0],t), lerp(p1[1],p2[1],t), lerp(p1[2],p2[2],t)];
+}
+function buildChunkMesh(chunk){
+  const baseX = chunk.cx * CHUNK, baseY = chunk.cy * CHUNK, baseZ = chunk.cz * CHUNK;
+  const pos = [];
+  const nrm = [];
+  function pushTri(a,b,c){
+    const pa = a.p, pb = b.p, pc = c.p;
+    const abx = pb[0]-pa[0], aby = pb[1]-pa[1], abz = pb[2]-pa[2];
+    const acx = pc[0]-pa[0], acy = pc[1]-pa[1], acz = pc[2]-pa[2];
+    let fn = cross(abx,aby,abz, acx,acy,acz);
+    const cx = (pa[0]+pb[0]+pc[0])/3, cy = (pa[1]+pb[1]+pc[1])/3, cz = (pa[2]+pb[2]+pc[2])/3;
+    const g = estimateGrad(cx,cy,cz);
+    if(dot3(fn[0],fn[1],fn[2], g[0],g[1],g[2]) < 0){
+      [b,c] = [c,b];
+      fn = cross(b.p[0]-pa[0],b.p[1]-pa[1],b.p[2]-pa[2], c.p[0]-pa[0],c.p[1]-pa[1],c.p[2]-pa[2]);
+    }
+    const na = a.n, nb = b.n, nc = c.n;
+    pos.push(...pa, ...b.p, ...c.p);
+    nrm.push(...na, ...nb, ...nc);
+  }
+  for(let x=0; x<CHUNK; x++) for(let y=0; y<CHUNK; y++) for(let z=0; z<CHUNK; z++){
+    const v = new Array(8);
+    const d = new Array(8);
+    for(let i=0;i<8;i++){
+      const gx = baseX + x + cubeVerts[i][0];
+      const gy = baseY + y + cubeVerts[i][1];
+      const gz = baseZ + z + cubeVerts[i][2];
+      v[i] = [gx,gy,gz];
+      d[i] = getDensityPoint(gx,gy,gz);
+    }
+    for(const tet of tets){
+      const tp = tet.map(i => v[i]);
+      const td = tet.map(i => d[i]);
+      const inside = [];
+      for(let i=0;i<4;i++) if(td[i] < 0) inside.push(i);
+      if(inside.length === 0 || inside.length === 4) continue;
+      const pts = [];
+      const norms = [];
+      for(const [a,b] of tetEdges){
+        const sa = td[a] < 0, sb = td[b] < 0;
+        if(sa === sb) continue;
+        const p = interp(tp[a], tp[b], td[a], td[b]);
+        const g = estimateGrad(p[0], p[1], p[2]);
+        pts.push(p);
+        norms.push(g);
+      }
+      if(pts.length < 3) continue;
+      const cx = pts.reduce((s,p)=>s+p[0],0)/pts.length;
+      const cy = pts.reduce((s,p)=>s+p[1],0)/pts.length;
+      const cz = pts.reduce((s,p)=>s+p[2],0)/pts.length;
+      let nx = 0, ny = 0, nz = 0;
+      for(let i=0;i<pts.length;i++){
+        const a = pts[i], b = pts[(i+1)%pts.length];
+        nx += (a[1]-cy)*(b[2]-cz) - (a[2]-cz)*(b[1]-cy);
+        ny += (a[2]-cz)*(b[0]-cx) - (a[0]-cx)*(b[2]-cz);
+        nz += (a[0]-cx)*(b[1]-cy) - (a[1]-cy)*(b[0]-cx);
+      }
+      const axis = Math.abs(nx) > Math.abs(ny) && Math.abs(nx) > Math.abs(nz) ? 0 : (Math.abs(ny) > Math.abs(nz) ? 1 : 2);
+      const u = axis === 0 ? [0,1,0] : [1,0,0];
+      const pnorm = norm3(nx,ny,nz);
+      let ux = u[1]*pnorm[2]-u[2]*pnorm[1], uy = u[2]*pnorm[0]-u[0]*pnorm[2], uz = u[0]*pnorm[1]-u[1]*pnorm[0];
+      const ul = Math.hypot(ux,uy,uz) || 1; ux/=ul; uy/=ul; uz/=ul;
+      let vx = pnorm[1]*uz-pnorm[2]*uy, vy = pnorm[2]*ux-pnorm[0]*uz, vz = pnorm[0]*uy-pnorm[1]*ux;
+      const arr = pts.map((p,i)=>{
+        const rx = p[0]-cx, ry = p[1]-cy, rz = p[2]-cz;
+        return {p, n:norms[i], a: Math.atan2(dot3(rx,ry,rz, vx,vy,vz), dot3(rx,ry,rz, ux,uy,uz))};
+      }).sort((a,b)=>a.a-b.a);
+      if(arr.length === 3){
+        pushTri(arr[0], arr[1], arr[2]);
+      } else if(arr.length === 4){
+        pushTri(arr[0], arr[1], arr[2]);
+        pushTri(arr[0], arr[2], arr[3]);
+      }
+    }
+  }
+  const vertCount = pos.length / 3;
+  const pbuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, pbuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
+  const nbuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, nbuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nrm), gl.STATIC_DRAW);
+  if(chunk.vb) gl.deleteBuffer(chunk.vb);
+  if(chunk.nb) gl.deleteBuffer(chunk.nb);
+  chunk.vb = pbuf;
+  chunk.nb = nbuf;
+  chunk.count = vertCount;
+  chunk.dirty = false;
+  chunk.lastBuilt = performance.now();
+}
+function processDirtyChunks(){
+  let built = 0;
+  const start = performance.now();
+  while(dirtyQueue.length && built < MAX_BUILD_PER_FRAME && performance.now() - start < 9){
+    const c = dirtyQueue.shift();
+    if(!c || !c.dirty) continue;
+    buildChunkMesh(c);
+    built++;
+  }
+}
+
+function sphereToCapsulePoints(pos, h){
+  return [ [pos[0], pos[1] - h*0.5, pos[2]], [pos[0], pos[1] + h*0.5, pos[2]] ];
+}
+
+const player = {
+  pos:[0,30,0],
+  vel:[0,0,0],
+  yaw:0,
+  pitch:0,
+  radius:0.45,
+  height:1.7,
+  grounded:false,
+  health:1
+};
+let keys = Object.create(null);
+let pointerLocked = false;
+let attackCooldown = 0;
+let grabState = null;
+let lastTime = performance.now();
+
+addEventListener('keydown', e => { keys[e.code] = true; if(e.code === 'KeyF') handleGrab(); });
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('mousedown', e => { if(pointerLocked){ if(e.button === 0) handlePunch('forward'); } });
+canvas.addEventListener('click', () => { if(canvas.requestPointerLock) canvas.requestPointerLock(); });
+document.addEventListener('pointerlockchange', ()=>{ pointerLocked = document.pointerLockElement === canvas; });
+document.addEventListener('mousemove', e => {
+  if(!pointerLocked) return;
+  player.yaw -= e.movementX * 0.0022;
+  player.pitch -= e.movementY * 0.0022;
+  player.pitch = clamp(player.pitch, -1.2, 1.1);
+});
+
+function dirFromYawPitch(yaw,pitch){
+  const cp = Math.cos(pitch), sp = Math.sin(pitch), cy = Math.cos(yaw), sy = Math.sin(yaw);
+  return [sy*cp, sp, cy*cp];
+}
+function yawForward(yaw){ return [Math.sin(yaw),0,Math.cos(yaw)]; }
+function yawRight(yaw){ return [Math.cos(yaw),0,-Math.sin(yaw)]; }
+function getCapsuleSamples(pos){ return sphereToCapsulePoints([pos[0], pos[1], pos[2]], player.height); }
+function resolvePlayerCollision(){
+  player.grounded = false;
+  const samples = getCapsuleSamples(player.pos);
+  let pushX=0,pushY=0,pushZ=0, count=0;
+  for(const s of samples){
+    const d = sampleDensity(s[0], s[1], s[2]);
+    if(d < player.radius * 0.75){
+      const g = gradientAt(s[0], s[1], s[2]);
+      const penetration = (player.radius * 0.75) - d;
+      pushX += g[0] * penetration;
+      pushY += g[1] * penetration;
+      pushZ += g[2] * penetration;
+      count++;
+      if(g[1] > 0.35) player.grounded = true;
+    }
+  }
+  if(count){
+    player.pos[0] += pushX / count;
+    player.pos[1] += pushY / count;
+    player.pos[2] += pushZ / count;
+    if(pushY/count > 0) player.vel[1] = Math.max(player.vel[1], 0);
+  }
+}
+function sampleDensity(x,y,z){
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const u = smooth(fx), v = smooth(fy), w = smooth(fz);
+  function d(a,b,c){ return getDensityPoint(ix+a, iy+b, iz+c); }
+  const x00 = lerp(d(0,0,0), d(1,0,0), u);
+  const x10 = lerp(d(0,1,0), d(1,1,0), u);
+  const x01 = lerp(d(0,0,1), d(1,0,1), u);
+  const x11 = lerp(d(0,1,1), d(1,1,1), u);
+  const y0 = lerp(x00, x10, v);
+  const y1 = lerp(x01, x11, v);
+  return lerp(y0, y1, w);
+}
+function gradientAt(x,y,z){
+  const e = 0.35;
+  const dx = sampleDensity(x+e,y,z) - sampleDensity(x-e,y,z);
+  const dy = sampleDensity(x,y+e,z) - sampleDensity(x,y-e,z);
+  const dz = sampleDensity(x,y,z+e) - sampleDensity(x,y,z-e);
+  return norm3(dx,dy,dz);
+}
+function ensureVisibleChunks(){
+  const cx = Math.floor(player.pos[0] / CHUNK);
+  const cy = Math.floor(player.pos[1] / CHUNK);
+  const cz = Math.floor(player.pos[2] / CHUNK);
+  for(let x=cx-renderRadiusX; x<=cx+renderRadiusX; x++) for(let y=cy-renderRadiusY; y<=cy+renderRadiusY; y++) for(let z=cz-renderRadiusX; z<=cz+renderRadiusX; z++){
+    getChunk(x,y,z,true);
+  }
+}
+function handlePunch(kind){
+  if(attackCooldown > 0) return;
+  attackCooldown = 0.18;
+  const fwd = dirFromYawPitch(player.yaw, player.pitch);
+  const side = yawRight(player.yaw);
+  const up = [0,1,0];
+  const hand = [player.pos[0] + fwd[0]*1.5, player.pos[1] + 1.0 + fwd[1]*0.5, player.pos[2] + fwd[2]*1.5];
+  if(kind === 'forward'){
+    deformCapsule([hand[0]+fwd[0]*0.6, hand[1]+fwd[1]*0.6, hand[2]+fwd[2]*0.6], [hand[0]+fwd[0]*4.5, hand[1]+fwd[1]*4.5, hand[2]+fwd[2]*4.5], 1.7, 5.2, 5);
+  } else if(kind === 'up'){
+    const a = [player.pos[0] + fwd[0]*1.2, player.pos[1] + 1.0, player.pos[2] + fwd[2]*1.2];
+    const b = [a[0] + fwd[0]*2.4, a[1] + 4.2, a[2] + fwd[2]*2.4];
+    deformCapsule(a, b, 1.5, 4.4, 5);
+  } else if(kind === 'down'){
+    const a = [player.pos[0], player.pos[1] - 0.2, player.pos[2]];
+    const b = [player.pos[0] + fwd[0]*0.8, player.pos[1] - 4.6, player.pos[2] + fwd[2]*0.8];
+    deformCapsule(a, b, 1.4, 6.0, 6);
+  }
+}
+function nearestTerrainPointInFront(){
+  const fwd = dirFromYawPitch(player.yaw, player.pitch);
+  return [player.pos[0] + fwd[0]*3.5, player.pos[1] + 1.1 + fwd[1]*2.2, player.pos[2] + fwd[2]*3.5];
+}
+function copyLocalRegion(center, size){
+  const half = Math.floor(size/2);
+  const data = [];
+  for(let x=-half; x<=half; x++) for(let y=-half; y<=half; y++) for(let z=-half; z<=half; z++){
+    const gx = Math.round(center[0]) + x;
+    const gy = Math.round(center[1]) + y;
+    const gz = Math.round(center[2]) + z;
+    data.push({x:x,y:y,z:z,v:getDensityPoint(gx,gy,gz)});
+  }
+  return data;
+}
+function writeLocalRegion(center, data){
+  for(const p of data){
+    const gx = Math.round(center[0]) + p.x;
+    const gy = Math.round(center[1]) + p.y;
+    const gz = Math.round(center[2]) + p.z;
+    setDensityPoint(gx,gy,gz,p.v);
+    markPointDirty(gx,gy,gz);
+  }
+}
+function carveLocalRegion(center, size, amount){
+  const half = Math.floor(size/2);
+  for(let x=-half; x<=half; x++) for(let y=-half; y<=half; y++) for(let z=-half; z<=half; z++){
+    const gx = Math.round(center[0]) + x;
+    const gy = Math.round(center[1]) + y;
+    const gz = Math.round(center[2]) + z;
+    const d = Math.hypot(x,y,z);
+    if(d > half + 0.4) continue;
+    const t = 1 - d / (half + 0.4);
+    const fall = t*t*(3-2*t);
+    addDensityPoint(gx,gy,gz, amount * fall * fall);
+    markPointDirty(gx,gy,gz);
+  }
+}
+function buildDebrisMesh(data, size){
+  const pos=[]; const nrm=[];
+  const base = Math.floor(size/2);
+  const local = new Map();
+  for(const p of data) local.set(p.x+','+p.y+','+p.z, p.v);
+  function getLocal(ix,iy,iz){
+    const k = ix+','+iy+','+iz;
+    return local.has(k) ? local.get(k) : 10;
+  }
+  function sampleLocal(x,y,z){
+    const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+    const fx = x - ix, fy = y - iy, fz = z - iz;
+    const u = smooth(fx), v = smooth(fy), w = smooth(fz);
+    function d(a,b,c){ return getLocal(ix+a, iy+b, iz+c); }
+    const x00 = lerp(d(0,0,0), d(1,0,0), u);
+    const x10 = lerp(d(0,1,0), d(1,1,0), u);
+    const x01 = lerp(d(0,0,1), d(1,0,1), u);
+    const x11 = lerp(d(0,1,1), d(1,1,1), u);
+    const y0 = lerp(x00, x10, v);
+    const y1 = lerp(x01, x11, v);
+    return lerp(y0, y1, w);
+  }
+  function gAt(x,y,z){
+    const e=0.35;
+    const dx = sampleLocal(x+e,y,z) - sampleLocal(x-e,y,z);
+    const dy = sampleLocal(x,y+e,z) - sampleLocal(x,y-e,z);
+    const dz = sampleLocal(x,y,z+e) - sampleLocal(x,y,z-e);
+    return norm3(dx,dy,dz);
+  }
+  for(let x=-base; x<base; x++) for(let y=-base; y<base; y++) for(let z=-base; z<base; z++){
+    const v = new Array(8);
+    const d = new Array(8);
+    for(let i=0;i<8;i++){
+      const gx = x + cubeVerts[i][0], gy = y + cubeVerts[i][1], gz = z + cubeVerts[i][2];
+      v[i] = [gx,gy,gz];
+      d[i] = getLocal(gx,gy,gz);
+    }
+    for(const tet of tets){
+      const tp = tet.map(i=>v[i]);
+      const td = tet.map(i=>d[i]);
+      const pts=[]; const norms=[];
+      for(const [a,b] of tetEdges){
+        const sa = td[a] < 0, sb = td[b] < 0;
+        if(sa === sb) continue;
+        const p = interp(tp[a],tp[b],td[a],td[b]);
+        pts.push(p); norms.push(gAt(p[0],p[1],p[2]));
+      }
+      if(pts.length < 3) continue;
+      const cx = pts.reduce((s,p)=>s+p[0],0)/pts.length;
+      const cy = pts.reduce((s,p)=>s+p[1],0)/pts.length;
+      const cz = pts.reduce((s,p)=>s+p[2],0)/pts.length;
+      let nx = 0, ny = 0, nz = 0;
+      for(let i=0;i<pts.length;i++){
+        const a = pts[i], b = pts[(i+1)%pts.length];
+        nx += (a[1]-cy)*(b[2]-cz) - (a[2]-cz)*(b[1]-cy);
+        ny += (a[2]-cz)*(b[0]-cx) - (a[0]-cx)*(b[2]-cz);
+        nz += (a[0]-cx)*(b[1]-cy) - (a[1]-cy)*(b[0]-cx);
+      }
+      const pnorm = norm3(nx,ny,nz);
+      let ux = 1, uy = 0, uz = 0;
+      if(Math.abs(pnorm[0]) > 0.9){ ux = 0; uy = 1; uz = 0; }
+      let vx = pnorm[1]*uz-pnorm[2]*uy, vy = pnorm[2]*ux-pnorm[0]*uz, vz = pnorm[0]*uy-pnorm[1]*ux;
+      const vl = Math.hypot(vx,vy,vz) || 1; vx/=vl; vy/=vl; vz/=vl;
+      const arr = pts.map((p,i)=>{ const rx=p[0]-cx, ry=p[1]-cy, rz=p[2]-cz; return {p, n:norms[i], a:Math.atan2(dot3(rx,ry,rz,vx,vy,vz), dot3(rx,ry,rz,ux,uy,uz))}; }).sort((a,b)=>a.a-b.a);
+      if(arr.length===3){ coords.push(arr[0],arr[1],arr[2]); }
+      else if(arr.length===4){ coords.push(arr[0],arr[1],arr[2], arr[0],arr[2],arr[3]); }
+    }
+  }
+  const pbuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pbuf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(coords.flatMap(v=>v.p)), gl.STATIC_DRAW);
+  const nbuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nbuf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(coords.flatMap(v=>v.n)), gl.STATIC_DRAW);
+  return {vb:pbuf, nb:nbuf, count:coords.length};
+}
+function makeGrabObject(){
+  const center = nearestTerrainPointInFront();
+  const size = 8;
+  const data = copyLocalRegion(center, size);
+  carveLocalRegion(center, size, 12);
+  const mesh = buildDebrisMesh(data, size);
+  grabState = {
+    pos:[center[0], center[1], center[2]],
+    vel:[0,0,0],
+    rot:0,
+    ang:0,
+    size,
+    data,
+    mesh,
+    source:[center[0], center[1], center[2]],
+    held:true,
+    life:0
+  };
+}
+function handleGrab(){
+  if(grabState){
+    if(grabState.held){
+      const speed = Math.hypot(player.vel[0], player.vel[1], player.vel[2]);
+      const dist = Math.hypot(grabState.pos[0]-grabState.source[0], grabState.pos[1]-grabState.source[1], grabState.pos[2]-grabState.source[2]);
+      if(speed < 2.2 && dist < 4.5){
+        writeLocalRegion(grabState.pos, grabState.data);
+        if(grabState.mesh){ gl.deleteBuffer(grabState.mesh.vb); gl.deleteBuffer(grabState.mesh.nb); }
+        grabState = null;
+      } else {
+        const fwd = dirFromYawPitch(player.yaw, player.pitch);
+        grabState.held = false;
+        grabState.vel[0] = fwd[0]*11 + player.vel[0];
+        grabState.vel[1] = fwd[1]*8 + 3;
+        grabState.vel[2] = fwd[2]*11 + player.vel[2];
+      }
+    }
+    return;
+  }
+  makeGrabObject();
+}
+
+function updateGrab(dt){
+  if(!grabState) return;
+  grabState.life += dt;
+  if(grabState.held){
+    const fwd = dirFromYawPitch(player.yaw, player.pitch);
+    grabState.pos[0] = player.pos[0] + fwd[0]*3.1;
+    grabState.pos[1] = player.pos[1] + 1.2 + fwd[1]*2.0;
+    grabState.pos[2] = player.pos[2] + fwd[2]*3.1;
+    grabState.rot = player.yaw;
+  } else {
+    grabState.vel[1] -= 18 * dt;
+    grabState.pos[0] += grabState.vel[0] * dt;
+    grabState.pos[1] += grabState.vel[1] * dt;
+    grabState.pos[2] += grabState.vel[2] * dt;
+    if(grabState.pos[1] < 1){
+      writeLocalRegion(grabState.pos, grabState.data);
+      if(grabState.mesh){ gl.deleteBuffer(grabState.mesh.vb); gl.deleteBuffer(grabState.mesh.nb); }
+      grabState = null;
+      return;
+    }
+    if(grabState.life > 20){
+      if(grabState.mesh){ gl.deleteBuffer(grabState.mesh.vb); gl.deleteBuffer(grabState.mesh.nb); }
+      grabState = null;
+      return;
+    }
+  }
+}
+
+function updatePlayer(dt){
+  if(attackCooldown > 0) attackCooldown -= dt;
+  if(keys['KeyQ']) handlePunch('up');
+  if(keys['KeyE']) handlePunch('down');
+  const fwd = yawForward(player.yaw);
+  const right = yawRight(player.yaw);
+  let mx = 0, mz = 0;
+  if(keys['KeyW']) { mx += fwd[0]; mz += fwd[2]; }
+  if(keys['KeyS']) { mx -= fwd[0]; mz -= fwd[2]; }
+  if(keys['KeyD']) { mx += right[0]; mz += right[2]; }
+  if(keys['KeyA']) { mx -= right[0]; mz -= right[2]; }
+  const ml = Math.hypot(mx,mz) || 1;
+  mx /= ml; mz /= ml;
+  const accel = player.grounded ? 28 : 13;
+  player.vel[0] += mx * accel * dt;
+  player.vel[2] += mz * accel * dt;
+  const friction = player.grounded ? 12 : 1.2;
+  player.vel[0] -= player.vel[0] * clamp(friction*dt,0,1);
+  player.vel[2] -= player.vel[2] * clamp(friction*dt,0,1);
+  player.vel[1] -= 24 * dt;
+  if(keys['Space'] && player.grounded){ player.vel[1] = 9.5; player.grounded = false; }
+  player.pos[0] += player.vel[0] * dt;
+  player.pos[1] += player.vel[1] * dt;
+  player.pos[2] += player.vel[2] * dt;
+  for(let i=0;i<4;i++) resolvePlayerCollision();
+}
+
+function drawMesh(mesh, model, color, camPos, view, proj){
+  if(!mesh || !mesh.count) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vb);
+  gl.enableVertexAttribArray(loc.aPos);
+  gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, mesh.nb);
+  gl.enableVertexAttribArray(loc.aNormal);
+  gl.vertexAttribPointer(loc.aNormal, 3, gl.FLOAT, false, 0, 0);
+  gl.uniformMatrix4fv(loc.uModel, false, model);
+  gl.uniform3f(loc.uBaseColor, color[0], color[1], color[2]);
+  gl.drawArrays(gl.TRIANGLES, 0, mesh.count);
+}
+
+function makePlayerMesh(){
+  const lat = 10, lon = 12, r = 0.5, h = 1.5;
+  const pos = [], nrm = [];
+  function addSphere(cx, cy, cz, rr, sy0, sy1){
+    for(let i=0;i<lat;i++){
+      const t0 = i/lat, t1 = (i+1)/lat;
+      const p0 = t0*Math.PI, p1 = t1*Math.PI;
+      for(let j=0;j<lon;j++){
+        const u0 = j/lon*2*Math.PI, u1 = (j+1)/lon*2*Math.PI;
+        const v = [
+          [Math.sin(p0)*Math.cos(u0), Math.cos(p0), Math.sin(p0)*Math.sin(u0)],
+          [Math.sin(p1)*Math.cos(u0), Math.cos(p1), Math.sin(p1)*Math.sin(u0)],
+          [Math.sin(p1)*Math.cos(u1), Math.cos(p1), Math.sin(p1)*Math.sin(u1)],
+          [Math.sin(p0)*Math.cos(u1), Math.cos(p0), Math.sin(p0)*Math.sin(u1)]
+        ];
+        const tris = [[0,1,2],[0,2,3]];
+        for(const t of tris){
+          for(const idx of t){
+            const p = v[idx];
+            pos.push(cx + p[0]*rr, cy + p[1]*rr, cz + p[2]*rr);
+            nrm.push(p[0], p[1], p[2]);
+          }
+        }
+      }
+    }
+  }
+  addSphere(0, h*0.5, 0, r, 0, 1);
+  addSphere(0, -h*0.5, 0, r, 0, 1);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(pos), gl.STATIC_DRAW);
+  const nb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(nrm), gl.STATIC_DRAW);
+  return {vb, nb, count: pos.length/3};
+}
+const playerMesh = makePlayerMesh();
+
+function updateWorld(){
+  ensureVisibleChunks();
+  processDirtyChunks();
+}
+
+function render(now){
+  const dt = Math.min(0.033, (now - lastTime) / 1000);
+  lastTime = now;
+  updatePlayer(dt);
+  updateGrab(dt);
+  updateWorld();
+
+  const camDist = 6.2;
+  const camTarget = [player.pos[0], player.pos[1] + 1.0, player.pos[2]];
+  const cf = dirFromYawPitch(player.yaw, player.pitch);
+  let camPos = [camTarget[0] - cf[0]*camDist, camTarget[1] + 1.1 - cf[1]*camDist, camTarget[2] - cf[2]*camDist];
+  const backCheck = [camTarget[0] - cf[0]*1.2, camTarget[1] - cf[1]*1.2, camTarget[2] - cf[2]*1.2];
+  const camD = sampleDensity(camPos[0],camPos[1],camPos[2]);
+  if(camD < 0){
+    camPos = [backCheck[0], backCheck[1], backCheck[2]];
+  }
+  const view = mat4LookAt(camPos, camTarget, [0,1,0]);
+  const proj = mat4Perspective(Math.PI/3, W/H, 0.1, 300);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.uniformMatrix4fv(loc.uProj, false, proj);
+  gl.uniformMatrix4fv(loc.uView, false, view);
+  gl.uniform3f(loc.uLightDir, 0.35, 1.0, 0.25);
+  gl.uniform3f(loc.uCamPos, camPos[0], camPos[1], camPos[2]);
+
+  const cx = Math.floor(player.pos[0] / CHUNK), cy = Math.floor(player.pos[1] / CHUNK), cz = Math.floor(player.pos[2] / CHUNK);
+  const drawList = [];
+  for(const c of chunks.values()){
+    const dx = c.cx - cx, dy = c.cy - cy, dz = c.cz - cz;
+    c.visible = Math.abs(dx) <= renderRadiusX+1 && Math.abs(dy) <= renderRadiusY+1 && Math.abs(dz) <= renderRadiusX+1;
+    if(c.visible && c.count > 0) drawList.push(c);
+  }
+  drawList.sort((a,b)=>{
+    const da = (a.cx-cx)**2 + (a.cy-cy)**2 + (a.cz-cz)**2;
+    const db = (b.cx-cx)**2 + (b.cy-cy)**2 + (b.cz-cz)**2;
+    return da - db;
+  });
+  for(const c of drawList){
+    drawMesh({vb:c.vb, nb:c.nb, count:c.count}, mat4Identity(), [0.58,0.48,0.34], camPos, view, proj);
+  }
+
+  if(grabState){
+    let gm = mat4Translate(mat4Identity(), grabState.pos);
+    gm = mat4Mul(gm, mat4RotateY(mat4Identity(), grabState.rot));
+    const gs = mat4Scale(gm, [0.3,0.3,0.3]);
+    drawMesh(grabState.mesh, gs, [0.65,0.6,0.52], camPos, view, proj);
+  }
+
+  let pm = mat4Translate(mat4Identity(), [player.pos[0], player.pos[1]-0.2, player.pos[2]]);
+  pm = mat4Mul(pm, mat4RotateY(mat4Identity(), player.yaw));
+  const ps = mat4Scale(pm, [0.9,1.2,0.9]);
+  drawMesh(playerMesh, ps, [0.2,0.75,0.95], camPos, view, proj);
+
+  requestAnimationFrame(render);
+}
+
+for(let x=-2; x<=2; x++) for(let y=0; y<=3; y++) for(let z=-2; z<=2; z++) getChunk(x,y,z,true);
+requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
